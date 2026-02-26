@@ -381,6 +381,22 @@ def interactive_confirm(peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, n
     return memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str
 
 
+def needs_file_transfer(binary_path, cmd_args):
+    """Check if any relevant path is on an ephemeral filesystem (/scratch or /tmp).
+    Checks the executable path, cwd, and all command arguments that look like paths."""
+    paths_to_check = [binary_path, os.getcwd()]
+    for arg in cmd_args:
+        if os.sep in arg or arg.startswith("/"):
+            paths_to_check.append(arg)
+    for p in paths_to_check:
+        resolved = os.path.realpath(p) if p else ""
+        if resolved == "/scratch" or resolved.startswith("/scratch/"):
+            return True
+        if resolved == "/tmp" or resolved.startswith("/tmp/"):
+            return True
+    return False
+
+
 def write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str):
     """Write the HTCondor submit file."""
     cmd_name = os.path.basename(binary_path)
@@ -388,6 +404,7 @@ def write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmr
 
     # Build arguments string (everything after the executable)
     arguments = " ".join(cmd_args) if cmd_args else ""
+    transfer_files = needs_file_transfer(binary_path, cmd_args)
 
     # Build requirements list
     requirements = []
@@ -412,7 +429,10 @@ def write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmr
     lines.append(f"error = {cmd_name}.$(Cluster).$(Process).err")
     lines.append(f"log = {cmd_name}.$(Cluster).$(Process).log")
     lines.append(f"")
-    lines.append(f"should_transfer_files = NO")
+    if transfer_files:
+        lines.append(f"should_transfer_files = IF_NEEDED")
+    else:
+        lines.append(f"should_transfer_files = NO")
     lines.append(f"getenv = True")
     lines.append(f"queue")
     lines.append(f"")
