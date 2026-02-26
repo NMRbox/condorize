@@ -46,12 +46,18 @@ def parse_args():
         default=60,
         help="Monitoring duration in seconds (default: 60)",
     )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Output submit file path (default: <command>.sub)",
+    )
     args = parser.parse_args(our_args)
 
     if not cmd_args:
         parser.error("No command specified. Usage: condorize [--timeout N] -- command [args...]")
 
-    return args.timeout, cmd_args
+    return args.timeout, args.output, cmd_args
 
 
 def get_child_pids(pid):
@@ -162,7 +168,7 @@ def check_gpu_nvidia_smi(pids):
 
 def monitor_process(cmd, timeout):
     """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
-    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb)."""
+    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code)."""
     print(f"Starting: {' '.join(cmd)}")
     print(f"Monitoring for up to {timeout} seconds...")
 
@@ -173,6 +179,10 @@ def monitor_process(cmd, timeout):
     peak_cpus = 1
     gpu_used = False
     gpu_memory_mb = 0
+    exited_early = False
+    exit_code = None
+    # Track recent memory samples to detect if usage is still climbing
+    recent_rss = []
     start = time.time()
 
     try:
@@ -180,7 +190,11 @@ def monitor_process(cmd, timeout):
             # Check if process already exited
             ret = proc.poll()
             if ret is not None:
-                print(f"Process exited on its own (code {ret}) after {time.time() - start:.1f}s")
+                elapsed = time.time() - start
+                print(f"\r  Process exited on its own (code {ret}) after {elapsed:.1f}s"
+                      + " " * 20)
+                exited_early = True
+                exit_code = ret
                 break
 
             # Collect PIDs in the process tree
@@ -189,6 +203,10 @@ def monitor_process(cmd, timeout):
             # Memory: sum RSS across process tree
             total_rss = sum(read_proc_memory(p) for p in pids)
             peak_rss_kb = max(peak_rss_kb, total_rss)
+            recent_rss.append(total_rss)
+            # Keep last 10 samples (5 seconds worth)
+            if len(recent_rss) > 10:
+                recent_rss.pop(0)
 
             # CPUs: count total threads across process tree
             total_threads = sum(read_proc_threads(p) for p in pids)
@@ -238,7 +256,19 @@ def monitor_process(cmd, timeout):
             proc.wait()
 
     print()
-    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb
+
+    # Detect if resource usage was still climbing when we stopped
+    still_climbing = False
+    if not exited_early and len(recent_rss) >= 6:
+        first_half = recent_rss[:len(recent_rss) // 2]
+        second_half = recent_rss[len(recent_rss) // 2:]
+        avg_first = sum(first_half) / len(first_half)
+        avg_second = sum(second_half) / len(second_half)
+        # If the second half average is >10% higher than the first half, usage is climbing
+        if avg_first > 0 and (avg_second - avg_first) / avg_first > 0.10:
+            still_climbing = True
+
+    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code
 
 
 def inspect_package(command):
@@ -323,7 +353,35 @@ def format_memory_mb(kb):
     return max(64, int(math.ceil(mb_with_headroom / 64) * 64))
 
 
-def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version):
+def validate_requirements(nmrbox_req_str):
+    """Check condor_status to see if any nodes match the given requirement.
+    Returns (matches: int or None) - None if condor_status is unavailable."""
+    if not nmrbox_req_str:
+        return None
+    try:
+        result = subprocess.run(
+            ["condor_status", "-const", nmrbox_req_str, "-total"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        # Count lines that look like totals with machine counts
+        # The -total output ends with a summary line like "Total   N ..."
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts and parts[0] == "Total":
+                try:
+                    return int(parts[1])
+                except (IndexError, ValueError):
+                    pass
+        # If we got output but no Total line, count non-header non-empty lines
+        return 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
+                        nmrbox_software, nmrbox_version, still_climbing):
     """Present findings to user and let them adjust before writing submit file.
     Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str)."""
     suggested_mem = format_memory_mb(peak_rss_kb)
@@ -343,6 +401,14 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_
     else:
         print(f"  NMRBox requirement: None")
     print("=" * 60)
+
+    if still_climbing:
+        print()
+        print("  WARNING: Memory usage was still increasing when monitoring")
+        print("  stopped. The actual memory needs of your program may be")
+        print("  higher than what was observed. Consider increasing the")
+        print("  memory request or running with a longer --timeout.")
+
     print()
     print("  Review the settings below. Press Enter to accept the")
     print("  suggested value shown in [brackets], or type a new value.")
@@ -409,6 +475,14 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_
         ans = input(f"  Include NMRBox requirement '{req}'? [Y/n]: ").strip().lower()
         if ans not in ("n", "no"):
             nmrbox_req_str = req
+            # Validate against the pool
+            matches = validate_requirements(nmrbox_req_str)
+            if matches is not None and matches == 0:
+                print()
+                print(f"  WARNING: No machines in the pool currently match the")
+                print(f"  requirement '{nmrbox_req_str}'. Your job may remain")
+                print(f"  idle indefinitely. You may want to check the available")
+                print(f"  versions with: condor_status -af {nmrbox_software}")
 
     return memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str
 
@@ -449,10 +523,40 @@ def condor_quote_args(args):
     return '"' + " ".join(quoted_parts) + '"'
 
 
-def write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str):
+def resolve_submit_filename(output_path, binary_path):
+    """Determine the submit filename, checking for collisions.
+    Returns the final filename to use."""
+    if output_path:
+        submit_filename = output_path
+    else:
+        cmd_name = os.path.basename(binary_path)
+        submit_filename = f"{cmd_name}.sub"
+
+    if os.path.exists(submit_filename):
+        while True:
+            ans = input(f"\n  '{submit_filename}' already exists. Overwrite? [y/N]: ").strip().lower()
+            if not ans or ans in ("n", "no"):
+                while True:
+                    new_name = input("  Enter a new filename: ").strip()
+                    if new_name:
+                        submit_filename = new_name
+                        if os.path.exists(submit_filename):
+                            ans2 = input(f"  '{submit_filename}' also exists. Overwrite? [y/N]: ").strip().lower()
+                            if ans2 in ("y", "yes"):
+                                break
+                        else:
+                            break
+                break
+            if ans in ("y", "yes"):
+                break
+
+    return submit_filename
+
+
+def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
+                      use_gpu, gpu_mem_mb, nmrbox_req_str):
     """Write the HTCondor submit file."""
     cmd_name = os.path.basename(binary_path)
-    submit_filename = f"{cmd_name}.sub"
 
     # Build arguments string using HTCondor new-style quoting.
     # The whole value is wrapped in double quotes. Individual arguments
@@ -471,15 +575,19 @@ def write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_m
     lines.append(f"executable = {binary_path}")
     if arguments:
         lines.append(f"arguments = {arguments}")
+    lines.append(f"initialdir = {os.getcwd()}")
     lines.append(f"")
     lines.append(f"request_memory = {memory_mb}")
     lines.append(f"request_cpus = {cpus}")
+    lines.append(f"request_disk = 2GB")
     if use_gpu:
         lines.append(f"request_gpus = 1")
     lines.append(f"")
     if requirements:
         lines.append(f"requirements = {' && '.join(requirements)}")
         lines.append(f"")
+    lines.append(f"+Production = True")
+    lines.append(f"")
     lines.append(f"output = {cmd_name}.$(Cluster).$(Process).out")
     lines.append(f"error = {cmd_name}.$(Cluster).$(Process).err")
     lines.append(f"log = {cmd_name}.$(Cluster).$(Process).log")
@@ -506,7 +614,7 @@ def write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_m
 
 
 def main():
-    timeout, cmd = parse_args()
+    timeout, output_path, cmd = parse_args()
 
     # Start package inspection in background while we monitor
     pkg_result = {}
@@ -521,7 +629,18 @@ def main():
     inspect_thread.start()
 
     # Monitor the process
-    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb = monitor_process(cmd, timeout)
+    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code = \
+        monitor_process(cmd, timeout)
+
+    # Warn if the process failed quickly
+    if exited_early and exit_code is not None and exit_code != 0:
+        elapsed_msg = "immediately" if peak_rss_kb == 0 else "before the monitoring period ended"
+        print(f"\n  WARNING: The process exited {elapsed_msg} with error code {exit_code}.")
+        print(f"  The monitored resource usage may not reflect actual needs.")
+        ans = input(f"  Continue generating a submit file anyway? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(1)
 
     # Wait for package inspection to finish (should already be done)
     inspect_thread.join(timeout=15)
@@ -534,12 +653,17 @@ def main():
 
     # Interactive confirmation
     memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str = interactive_confirm(
-        peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version
+        peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
+        nmrbox_software, nmrbox_version, still_climbing
     )
+
+    # Resolve output filename (check for collisions)
+    submit_filename = resolve_submit_filename(output_path, binary_path)
 
     # Write submit file
     cmd_args = cmd[1:] if len(cmd) > 1 else []
-    write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str)
+    write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
+                      use_gpu, gpu_mem_mb, nmrbox_req_str)
 
 
 if __name__ == "__main__":

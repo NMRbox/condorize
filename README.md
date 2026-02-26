@@ -7,7 +7,7 @@ HTCondor pool without writing submit files by hand.
 ## Usage
 
 ```
-condorize [--timeout SECONDS] -- command [arguments...]
+condorize [--timeout SECONDS] [--output FILE] -- command [arguments...]
 ```
 
 Prepend `condorize --` to the command you would normally run:
@@ -20,6 +20,12 @@ To change the monitoring duration from the default of 60 seconds:
 
 ```
 condorize --timeout 120 -- my_slow_program arg1 arg2
+```
+
+To specify the output submit file path:
+
+```
+condorize --output myjob.sub -- myprogram arg1
 ```
 
 ## What it does
@@ -46,6 +52,15 @@ A live status line shows progress during monitoring:
 ```
   [15s/60s] Peak RSS: 245.3 MB | CPUs: 4 | GPU: No
 ```
+
+If memory usage is still increasing when monitoring stops, condorize will warn
+you that the observed values may be underestimates and suggest running with a
+longer `--timeout`.
+
+If the program exits quickly with a non-zero exit code (e.g., bad arguments
+or a missing input file), condorize will warn you and ask whether to continue,
+since the monitored resource usage likely doesn't reflect the program's real
+needs.
 
 ### 2. Inspects the package (in parallel)
 
@@ -88,10 +103,16 @@ suggested default (shown in brackets), or type a new value:
 Memory suggestions include 25% headroom over the observed peak, rounded up to
 the nearest 64 MB.
 
+If an NMRBox requirement is included, condorize will query `condor_status` to
+check whether any machines in the pool currently match. If none do, it will
+print a warning so you can investigate before submitting.
+
 ### 4. Writes the submit file
 
 Condorize writes a `.sub` file named after the executable (e.g.,
-`voronota-voromqa.sub`) in the current directory, ready to submit:
+`voronota-voromqa.sub`) in the current directory, ready to submit. If a file
+with that name already exists, you will be asked whether to overwrite it or
+choose a different name.
 
 ```
 condor_submit voronota-voromqa.sub
@@ -100,8 +121,11 @@ condor_submit voronota-voromqa.sub
 The generated submit file includes:
 
 - `executable` and `arguments` (properly quoted for HTCondor)
-- `request_memory`, `request_cpus`, and `request_gpus` (if needed)
+- `initialdir` set to the directory where you ran condorize
+- `request_memory`, `request_cpus`, `request_disk` (default 2 GB), and
+  `request_gpus` (if needed)
 - `requirements` for NMRBox software version (if applicable)
+- `+Production = True` to target production NMRbox machines
 - `output`, `error`, and `log` files named with cluster and process IDs
 - `getenv = True` to preserve your shell environment
 - `should_transfer_files = NO` for the shared filesystem (automatically
@@ -122,3 +146,4 @@ shared filesystem.
 - Linux (uses `/proc` filesystem for monitoring)
 - `dpkg` and `dpkg-query` (for package inspection; gracefully skipped if unavailable)
 - `nvidia-smi` (for GPU detection; gracefully skipped if unavailable)
+- `condor_status` (for pool validation; gracefully skipped if unavailable)
