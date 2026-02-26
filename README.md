@@ -122,8 +122,8 @@ The generated submit file includes:
 
 - `executable` and `arguments` (properly quoted for HTCondor)
 - `initialdir` set to the directory where you ran condorize
-- `request_memory`, `request_cpus`, `request_disk` (default 2 GB), and
-  `request_gpus` (if needed)
+- `request_memory`, `request_cpus`, `request_disk` (default 2 GB),
+  `request_gpus`, and `require_gpus` with minimum GPU memory (if needed)
 - `requirements` for NMRBox software version (if applicable)
 - `+Production = True` to target production NMRbox machines
 - `output`, `error`, and `log` files named with cluster and process IDs

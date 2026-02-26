@@ -4,7 +4,6 @@
 import argparse
 import math
 import os
-import signal
 import subprocess
 import shutil
 import sys
@@ -16,26 +15,30 @@ def parse_args():
     """Parse command line arguments, splitting on '--' to separate our flags from the target command."""
     argv = sys.argv[1:]
 
-    # Split on '--' if present
     if "--" in argv:
         idx = argv.index("--")
         our_args = argv[:idx]
         cmd_args = argv[idx + 1:]
     else:
-        # First non-flag argument starts the command
-        our_args = []
-        cmd_args = []
-        for i, arg in enumerate(argv):
-            if not arg.startswith("-"):
-                cmd_args = argv[i:]
-                break
-            our_args.append(arg)
-            # Handle --timeout VALUE (grab next arg too)
-            if arg == "--timeout" and i + 1 < len(argv):
-                our_args.append(argv[i + 1])
-                cmd_args = argv[i + 2:]
-                break
+        # Use argparse's parse_known_args to consume our flags and leave the rest
+        # as the command. This avoids needing to manually track which flags take values.
+        parser = _build_parser()
+        args, cmd_args = parser.parse_known_args(argv)
+        if not cmd_args:
+            parser.error("No command specified. Usage: condorize [--timeout N] -- command [args...]")
+        return args.timeout, args.output, cmd_args
 
+    parser = _build_parser()
+    args = parser.parse_args(our_args)
+
+    if not cmd_args:
+        parser.error("No command specified. Usage: condorize [--timeout N] -- command [args...]")
+
+    return args.timeout, args.output, cmd_args
+
+
+def _build_parser():
+    """Build and return the argument parser."""
     parser = argparse.ArgumentParser(
         prog="condorize",
         description="Monitor a command and generate an HTCondor submit file.",
@@ -52,16 +55,11 @@ def parse_args():
         default=None,
         help="Output submit file path (default: <command>.sub)",
     )
-    args = parser.parse_args(our_args)
-
-    if not cmd_args:
-        parser.error("No command specified. Usage: condorize [--timeout N] -- command [args...]")
-
-    return args.timeout, args.output, cmd_args
+    return parser
 
 
-def get_child_pids(pid):
-    """Get all descendant PIDs of a process by walking /proc."""
+def get_direct_children(pid):
+    """Get direct child PIDs of a process by walking /proc."""
     children = set()
     try:
         for entry in os.listdir("/proc"):
@@ -72,9 +70,8 @@ def get_child_pids(pid):
                     stat = f.read().split()
                     # Field 4 (0-indexed 3) is PPID
                     ppid = int(stat[3])
-                    child_pid = int(entry)
-                    if ppid == pid or ppid in children:
-                        children.add(child_pid)
+                    if ppid == pid:
+                        children.add(int(entry))
             except (FileNotFoundError, PermissionError, IndexError, ValueError):
                 continue
     except FileNotFoundError:
@@ -83,16 +80,18 @@ def get_child_pids(pid):
 
 
 def get_process_tree_pids(root_pid):
-    """Get root PID plus all descendants."""
+    """Get root PID plus all descendants via breadth-first traversal."""
     pids = {root_pid}
-    # Multiple passes to catch nested children
-    for _ in range(5):
-        new_pids = set()
-        for pid in list(pids):
-            new_pids.update(get_child_pids(pid))
-        if not new_pids - pids:
-            break
-        pids.update(new_pids)
+    frontier = [root_pid]
+    while frontier:
+        next_frontier = []
+        for pid in frontier:
+            children = get_direct_children(pid)
+            for child in children:
+                if child not in pids:
+                    pids.add(child)
+                    next_frontier.append(child)
+        frontier = next_frontier
     return pids
 
 
@@ -169,10 +168,17 @@ def check_gpu_nvidia_smi(pids):
 def monitor_process(cmd, timeout):
     """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
     Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code)."""
+    try:
+        proc = subprocess.Popen(cmd)
+    except FileNotFoundError:
+        print(f"Error: Command not found: {cmd[0]}", file=sys.stderr)
+        sys.exit(1)
+    except PermissionError:
+        print(f"Error: Permission denied: {cmd[0]}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"Starting: {' '.join(cmd)}")
     print(f"Monitoring for up to {timeout} seconds...")
-
-    proc = subprocess.Popen(cmd)
     pid = proc.pid
 
     peak_rss_kb = 0
@@ -582,6 +588,8 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     lines.append(f"request_disk = 2GB")
     if use_gpu:
         lines.append(f"request_gpus = 1")
+        if gpu_mem_mb > 0:
+            lines.append(f"require_gpus = (GlobalMemoryMb >= {gpu_mem_mb})")
     lines.append(f"")
     if requirements:
         lines.append(f"requirements = {' && '.join(requirements)}")
