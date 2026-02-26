@@ -102,6 +102,18 @@ def read_proc_memory(pid):
     return 0
 
 
+def read_proc_threads(pid):
+    """Read thread count from /proc/PID/status. Returns thread count, or 0 on failure."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Threads:"):
+                    return int(line.split()[1])
+    except (FileNotFoundError, PermissionError, IndexError, ValueError):
+        pass
+    return 0
+
+
 def check_gpu_fd(pid):
     """Check if process has /dev/nvidia* file descriptors open."""
     try:
@@ -149,8 +161,8 @@ def check_gpu_nvidia_smi(pids):
 
 
 def monitor_process(cmd, timeout):
-    """Run cmd for up to timeout seconds, monitoring memory and GPU usage.
-    Returns (peak_rss_kb, gpu_used, gpu_memory_mb, exit_early)."""
+    """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
+    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb)."""
     print(f"Starting: {' '.join(cmd)}")
     print(f"Monitoring for up to {timeout} seconds...")
 
@@ -158,6 +170,7 @@ def monitor_process(cmd, timeout):
     pid = proc.pid
 
     peak_rss_kb = 0
+    peak_cpus = 1
     gpu_used = False
     gpu_memory_mb = 0
     start = time.time()
@@ -177,6 +190,10 @@ def monitor_process(cmd, timeout):
             total_rss = sum(read_proc_memory(p) for p in pids)
             peak_rss_kb = max(peak_rss_kb, total_rss)
 
+            # CPUs: count total threads across process tree
+            total_threads = sum(read_proc_threads(p) for p in pids)
+            peak_cpus = max(peak_cpus, total_threads)
+
             # GPU: check file descriptors
             if not gpu_used:
                 for p in pids:
@@ -194,6 +211,7 @@ def monitor_process(cmd, timeout):
             rss_mb = peak_rss_kb / 1024
             sys.stdout.write(
                 f"\r  [{elapsed:.0f}s/{timeout}s] Peak RSS: {rss_mb:.1f} MB | "
+                f"CPUs: {peak_cpus} | "
                 f"GPU: {'Yes' if gpu_used else 'No'}"
                 f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}   "
             )
@@ -220,8 +238,7 @@ def monitor_process(cmd, timeout):
             proc.wait()
 
     print()
-    exit_early = proc.returncode is not None and proc.poll() is not None
-    return peak_rss_kb, gpu_used, gpu_memory_mb
+    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb
 
 
 def inspect_package(command):
@@ -306,9 +323,9 @@ def format_memory_mb(kb):
     return max(64, int(math.ceil(mb_with_headroom / 64) * 64))
 
 
-def interactive_confirm(peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version):
+def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version):
     """Present findings to user and let them adjust before writing submit file.
-    Returns (memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str)."""
+    Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str)."""
     suggested_mem = format_memory_mb(peak_rss_kb)
     peak_mb = peak_rss_kb / 1024
 
@@ -317,6 +334,7 @@ def interactive_confirm(peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, n
     print("=" * 60)
     print(f"  Peak memory (RSS):  {peak_mb:.1f} MB")
     print(f"  Suggested request:  {suggested_mem} MB (with 25% headroom)")
+    print(f"  Peak CPUs/threads:  {peak_cpus}")
     print(f"  GPU used:           {'Yes' if gpu_used else 'No'}"
           f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}")
     if nmrbox_software and nmrbox_version:
@@ -339,6 +357,20 @@ def interactive_confirm(peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, n
         try:
             memory_mb = int(ans)
             if memory_mb <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("  Please enter a positive integer.")
+
+    # CPUs
+    while True:
+        ans = input(f"  CPUs to request [{peak_cpus}]: ").strip()
+        if not ans:
+            cpus = peak_cpus
+            break
+        try:
+            cpus = int(ans)
+            if cpus <= 0:
                 raise ValueError
             break
         except ValueError:
@@ -378,7 +410,7 @@ def interactive_confirm(peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, n
         if ans not in ("n", "no"):
             nmrbox_req_str = req
 
-    return memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str
+    return memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str
 
 
 def needs_file_transfer(binary_path, cmd_args):
@@ -397,7 +429,7 @@ def needs_file_transfer(binary_path, cmd_args):
     return False
 
 
-def write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str):
+def write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str):
     """Write the HTCondor submit file."""
     cmd_name = os.path.basename(binary_path)
     submit_filename = f"{cmd_name}.sub"
@@ -418,7 +450,7 @@ def write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmr
         lines.append(f"arguments = {arguments}")
     lines.append(f"")
     lines.append(f"request_memory = {memory_mb}")
-    lines.append(f"request_cpus = 1")
+    lines.append(f"request_cpus = {cpus}")
     if use_gpu:
         lines.append(f"request_gpus = 1")
     lines.append(f"")
@@ -466,7 +498,7 @@ def main():
     inspect_thread.start()
 
     # Monitor the process
-    peak_rss_kb, gpu_used, gpu_memory_mb = monitor_process(cmd, timeout)
+    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb = monitor_process(cmd, timeout)
 
     # Wait for package inspection to finish (should already be done)
     inspect_thread.join(timeout=15)
@@ -478,13 +510,13 @@ def main():
         binary_path = cmd[0]  # Use as-is if we couldn't resolve it
 
     # Interactive confirmation
-    memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str = interactive_confirm(
-        peak_rss_kb, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version
+    memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str = interactive_confirm(
+        peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, nmrbox_software, nmrbox_version
     )
 
     # Write submit file
     cmd_args = cmd[1:] if len(cmd) > 1 else []
-    write_submit_file(binary_path, cmd_args, memory_mb, use_gpu, gpu_mem_mb, nmrbox_req_str)
+    write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str)
 
 
 if __name__ == "__main__":
