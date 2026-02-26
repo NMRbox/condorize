@@ -429,13 +429,36 @@ def needs_file_transfer(binary_path, cmd_args):
     return False
 
 
+def condor_quote_args(args):
+    """Quote arguments for HTCondor new-style syntax.
+    Returns a double-quoted string where args with special characters
+    are individually single-quoted, and literal single quotes are doubled."""
+    # Characters that require an argument to be single-quoted
+    special = set(" \t\n\"'\\")
+    quoted_parts = []
+    for arg in args:
+        if not arg:
+            # Empty argument needs quoting
+            quoted_parts.append("''")
+        elif any(c in special for c in arg):
+            # Escape single quotes by doubling them, then wrap in single quotes
+            escaped = arg.replace("'", "''")
+            quoted_parts.append(f"'{escaped}'")
+        else:
+            quoted_parts.append(arg)
+    return '"' + " ".join(quoted_parts) + '"'
+
+
 def write_submit_file(binary_path, cmd_args, memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str):
     """Write the HTCondor submit file."""
     cmd_name = os.path.basename(binary_path)
     submit_filename = f"{cmd_name}.sub"
 
-    # Build arguments string (everything after the executable)
-    arguments = " ".join(cmd_args) if cmd_args else ""
+    # Build arguments string using HTCondor new-style quoting.
+    # The whole value is wrapped in double quotes. Individual arguments
+    # that contain spaces, quotes, or special characters are wrapped in
+    # single quotes, with literal single quotes escaped as ''.
+    arguments = condor_quote_args(cmd_args) if cmd_args else ""
     transfer_files = needs_file_transfer(binary_path, cmd_args)
 
     # Build requirements list
