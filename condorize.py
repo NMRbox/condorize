@@ -310,10 +310,22 @@ def inspect_package(command):
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return binary_path, None, None
 
-    # Check for NMRBox metadata
+    # Check for NMRBox metadata on this package
+    nmrbox_software, nmrbox_version = _get_nmrbox_metadata(package)
+
+    # If the direct package lacks metadata, check reverse dependencies —
+    # the binary's package may have been pulled in as a dependency of an
+    # nmrbox-tool-* wrapper that carries the metadata.
+    if not nmrbox_software or not nmrbox_version:
+        nmrbox_software, nmrbox_version = _check_rdepends_for_metadata(package)
+
+    return binary_path, nmrbox_software, nmrbox_version
+
+
+def _get_nmrbox_metadata(package):
+    """Return (nmrbox_software, nmrbox_version) for *package*, or (None, None)."""
     nmrbox_software = None
     nmrbox_version = None
-
     try:
         result = subprocess.run(
             ["dpkg-query", "-W", "-f",
@@ -340,8 +352,40 @@ def inspect_package(command):
                         nmrbox_version = line.split(":", 1)[1].strip()
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+    return nmrbox_software, nmrbox_version
 
-    return binary_path, nmrbox_software, nmrbox_version
+
+def _check_rdepends_for_metadata(package):
+    """Check installed reverse dependencies of *package* for NMRBox metadata.
+
+    Some binaries live in a plain upstream package (e.g. ``voronota``) that was
+    installed as a dependency of an NMRBox wrapper package
+    (e.g. ``nmrbox-tool-voronota``).  The wrapper carries the Nmrbox-Software
+    and Nmrbox-Version fields we need.
+    """
+    try:
+        result = subprocess.run(
+            ["apt-cache", "rdepends", "--installed", package],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None, None
+
+        # Output format:
+        #   package
+        #   Reverse Depends:
+        #     rdep1
+        #     rdep2
+        for line in result.stdout.splitlines():
+            rdep = line.strip()
+            if not rdep or rdep == package or rdep.endswith(":"):
+                continue
+            sw, ver = _get_nmrbox_metadata(rdep)
+            if sw and ver:
+                return sw, ver
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None, None
 
 
 def format_nmrbox_requirement(software, version):
