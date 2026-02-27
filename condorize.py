@@ -388,10 +388,25 @@ def _check_rdepends_for_metadata(package):
     return None, None
 
 
+CONDOR_MAPPINGS = (('-', ''),
+                   ('+', 'PLUS'),
+                   (' ', '_'),
+                   )
+
+
+def valid_condor_identifier(identifier):
+    """Replace invalid CONDOR characters.
+    Logic coordinated with svn+ssh://devel.nmrbox.org/svn/nmrbox/trunk/python-script/services/productionmonitor/src/productionmonitor/main.py"""
+    if str.isdigit(identifier[0]):
+        identifier = 'v' + identifier
+    for old, new in CONDOR_MAPPINGS:
+        identifier = identifier.replace(old, new)
+    return identifier
+
+
 def format_nmrbox_requirement(software, version):
-    """Format NMRBox software/version into a condor requirement string.
-    Version '1-21' becomes 'v121'."""
-    formatted_version = "v" + version.replace("-", "")
+    """Format NMRBox software/version into a condor requirement string."""
+    formatted_version = valid_condor_identifier(version)
     return f'{software} == "{formatted_version}"'
 
 
