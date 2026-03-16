@@ -1,0 +1,16 @@
+Source: nmrbox-tool-condorize
+Section: science
+Priority: optional
+Maintainer: Jon Wedell <wedell@uchc.edu>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.6.2
+Homepage: https://www.nmrbox.org
+
+Package: nmrbox-tool-condorize
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, python3
+Description: A command-line tool that monitors a program's resource usage and generates an HTCondor submit file. 
+ A command-line tool that monitors a program's resource usage and generates an HTCondor submit file. Designed for NMRbox users who want to run jobs on the HTCondor pool without writing submit files by hand.
