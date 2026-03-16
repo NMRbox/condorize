@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 
+__version__ = "1.0"
+
 
 def parse_args():
     """Parse command line arguments, splitting on '--' to separate our flags from the target command."""
@@ -42,6 +44,9 @@ def _build_parser():
     parser = argparse.ArgumentParser(
         prog="condorize",
         description="Monitor a command and generate an HTCondor submit file.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--timeout",
