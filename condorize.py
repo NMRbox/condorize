@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 
-__version__ = "1.0"
+__version__ = "1.0.1"
 
 
 def parse_args():
@@ -450,6 +450,11 @@ def validate_requirements(nmrbox_req_str):
         return None
 
 
+def get_machine_cpu_count():
+    """Return the number of CPUs on this machine."""
+    return os.cpu_count() or 1
+
+
 def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
                         nmrbox_software, nmrbox_version, still_climbing):
     """Present findings to user and let them adjust before writing submit file.
@@ -457,12 +462,21 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
     suggested_mem = format_memory_mb(peak_rss_kb)
     peak_mb = peak_rss_kb / 1024
 
+    # Cap suggested CPUs at the number of CPUs on this machine, since a
+    # program cannot usefully use more CPUs than the machine has, even if
+    # it spawns more threads (e.g. MATLAB's JVM and thread-pool workers).
+    machine_cpus = get_machine_cpu_count()
+    suggested_cpus = min(peak_cpus, machine_cpus)
+
     print("\n" + "=" * 60)
     print("  Condorize - Detected Settings")
     print("=" * 60)
     print(f"  Peak memory (RSS):  {peak_mb:.1f} MB")
     print(f"  Suggested request:  {suggested_mem} MB (with 25% headroom)")
-    print(f"  Peak CPUs/threads:  {peak_cpus}")
+    if peak_cpus > machine_cpus:
+        print(f"  Peak threads:       {peak_cpus} (capped to {machine_cpus} machine CPUs)")
+    else:
+        print(f"  Peak CPUs/threads:  {peak_cpus}")
     print(f"  GPU used:           {'Yes' if gpu_used else 'No'}"
           f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}")
     if nmrbox_software and nmrbox_version:
@@ -500,9 +514,9 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
 
     # CPUs
     while True:
-        ans = input(f"  CPUs to request [{peak_cpus}]: ").strip()
+        ans = input(f"  CPUs to request [{suggested_cpus}]: ").strip()
         if not ans:
-            cpus = peak_cpus
+            cpus = suggested_cpus
             break
         try:
             cpus = int(ans)
@@ -511,6 +525,24 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
             break
         except ValueError:
             print("  Please enter a positive integer.")
+
+    if cpus > 32:
+        print()
+        print(f"  WARNING: Requesting {cpus} CPUs. Jobs requesting more than")
+        print(f"  32 CPUs may take much longer to match to a machine.")
+        print(f"  If your program does not actually need this many CPUs,")
+        print(f"  consider reducing the request.")
+        while True:
+            ans = input(f"  Proceed with {cpus} CPUs, or enter a new value [{cpus}]: ").strip()
+            if not ans:
+                break
+            try:
+                cpus = int(ans)
+                if cpus <= 0:
+                    raise ValueError
+                break
+            except ValueError:
+                print("  Please enter a positive integer.")
 
     # GPU
     while True:
