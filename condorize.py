@@ -170,9 +170,70 @@ def check_gpu_nvidia_smi(pids):
         return False, 0
 
 
+def collect_open_files(pids):
+    """Collect file paths opened by the given PIDs from /proc maps and fd."""
+    files = set()
+    for pid in pids:
+        # Memory-mapped files (shared libraries, executables)
+        try:
+            with open(f"/proc/{pid}/maps") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        path = parts[-1]
+                        if path.startswith('/'):
+                            files.add(path)
+        except (FileNotFoundError, PermissionError):
+            pass
+        # Open file descriptors
+        try:
+            fd_dir = f"/proc/{pid}/fd"
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                    if target.startswith('/'):
+                        files.add(target)
+                except (FileNotFoundError, PermissionError):
+                    continue
+        except (FileNotFoundError, PermissionError):
+            pass
+    return files
+
+
+def _file_scanner(root_pid, stop_event, all_open_files):
+    """Background thread: rapidly scan process tree for open files.
+
+    Short-lived child processes (e.g. commands in a shell script) may start and
+    exit between the main monitoring loop's 0.5 s samples.  This thread polls at
+    50 ms intervals, reading each descendant's /proc/PID/exe (a single readlink,
+    very fast) so we catch executables that would otherwise be missed.  A full
+    maps + fd collection runs less frequently to capture shared libraries and
+    data files without excessive overhead.
+    """
+    iteration = 0
+    while not stop_event.is_set():
+        try:
+            pids = get_process_tree_pids(root_pid)
+            # Fast: read /proc/PID/exe for every PID (catches short-lived children)
+            for pid in pids:
+                try:
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                    if exe.startswith('/'):
+                        all_open_files.add(exe)
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass
+            # Slower: full maps + fd scan every ~1 s (20 iterations * 50 ms)
+            iteration += 1
+            if iteration % 20 == 0:
+                all_open_files.update(collect_open_files(pids))
+        except Exception:
+            pass
+        stop_event.wait(0.05)
+
+
 def monitor_process(cmd, timeout):
     """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
-    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code)."""
+    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files)."""
     try:
         proc = subprocess.Popen(cmd)
     except FileNotFoundError:
@@ -192,12 +253,23 @@ def monitor_process(cmd, timeout):
     gpu_memory_mb = 0
     exited_early = False
     exit_code = None
+    all_open_files = set()
     # Track recent memory samples to detect if usage is still climbing
     recent_rss = []
     start = time.time()
 
+    # Start background file scanner to catch short-lived child processes
+    scanner_stop = threading.Event()
+    scanner_thread = threading.Thread(
+        target=_file_scanner, args=(pid, scanner_stop, all_open_files), daemon=True,
+    )
+    scanner_thread.start()
+
     try:
         while time.time() - start < timeout:
+            # Collect PIDs in the process tree
+            pids = get_process_tree_pids(pid)
+
             # Check if process already exited
             ret = proc.poll()
             if ret is not None:
@@ -207,9 +279,6 @@ def monitor_process(cmd, timeout):
                 exited_early = True
                 exit_code = ret
                 break
-
-            # Collect PIDs in the process tree
-            pids = get_process_tree_pids(pid)
 
             # Memory: sum RSS across process tree
             total_rss = sum(read_proc_memory(p) for p in pids)
@@ -266,6 +335,10 @@ def monitor_process(cmd, timeout):
             proc.kill()
             proc.wait()
 
+    # Stop the file scanner
+    scanner_stop.set()
+    scanner_thread.join(timeout=2)
+
     print()
 
     # Detect if resource usage was still climbing when we stopped
@@ -279,118 +352,118 @@ def monitor_process(cmd, timeout):
         if avg_first > 0 and (avg_second - avg_first) / avg_first > 0.10:
             still_climbing = True
 
-    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code
+    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files
 
 
-def inspect_package(command):
-    """Look up the binary's package and check for NMRBox metadata.
-    Returns (binary_path, nmrbox_software, nmrbox_version) or (binary_path, None, None).
-    Safe to call from a background thread (no direct print output)."""
-    binary_path = shutil.which(command)
-    if not binary_path:
-        return None, None, None
+def precompute_nmrbox_data():
+    """Build a mapping of all installed NMRBox packages and a reverse dependency map.
 
-    # Resolve symlinks to get the real path
-    binary_path_resolved = os.path.realpath(binary_path)
+    Returns (nmrbox_pkgs, dep_to_nmrbox) where:
+      nmrbox_pkgs: {package_name: (software, version)}
+      dep_to_nmrbox: {dependency_name: {(software, version), ...}}
 
-    # Find which package owns this binary
-    try:
-        result = subprocess.run(
-            ["dpkg", "-S", binary_path_resolved],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            # Try the unresolved path
-            result = subprocess.run(
-                ["dpkg", "-S", binary_path],
-                capture_output=True, text=True, timeout=10,
-            )
-        if result.returncode != 0:
-            return binary_path, None, None
+    Safe to call from a background thread.
+    """
+    nmrbox_pkgs = {}
 
-        # Output format: "package: /path/to/file"
-        package = result.stdout.strip().split(":")[0]
-        # Handle diversion lines or multi-arch suffixes
-        package = package.split(",")[0].strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return binary_path, None, None
-
-    # Check for NMRBox metadata on this package
-    nmrbox_software, nmrbox_version = _get_nmrbox_metadata(package)
-
-    # If the direct package lacks metadata, check reverse dependencies —
-    # the binary's package may have been pulled in as a dependency of an
-    # nmrbox-tool-* wrapper that carries the metadata.
-    if not nmrbox_software or not nmrbox_version:
-        nmrbox_software, nmrbox_version = _check_rdepends_for_metadata(package)
-
-    return binary_path, nmrbox_software, nmrbox_version
-
-
-def _get_nmrbox_metadata(package):
-    """Return (nmrbox_software, nmrbox_version) for *package*, or (None, None)."""
-    nmrbox_software = None
-    nmrbox_version = None
+    # Get all installed packages with NMRBox metadata in one call
     try:
         result = subprocess.run(
             ["dpkg-query", "-W", "-f",
-             "${Nmrbox-Software}\\n${Nmrbox-Version}\\n", package],
-            capture_output=True, text=True, timeout=10,
+             "${Package}\t${Nmrbox-Software}\t${Nmrbox-Version}\n"],
+            capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0:
-            lines = result.stdout.strip().splitlines()
-            if len(lines) >= 2 and lines[0] and lines[1]:
-                nmrbox_software = lines[0].strip()
-                nmrbox_version = lines[1].strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # Fallback: parse apt show output
-        try:
-            result = subprocess.run(
-                ["apt", "show", package],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if line.startswith("Nmrbox-Software:"):
-                        nmrbox_software = line.split(":", 1)[1].strip()
-                    elif line.startswith("Nmrbox-Version:"):
-                        nmrbox_version = line.split(":", 1)[1].strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-    return nmrbox_software, nmrbox_version
-
-
-def _check_rdepends_for_metadata(package):
-    """Check installed reverse dependencies of *package* for NMRBox metadata.
-
-    Some binaries live in a plain upstream package (e.g. ``voronota``) that was
-    installed as a dependency of an NMRBox wrapper package
-    (e.g. ``nmrbox-tool-voronota``).  The wrapper carries the Nmrbox-Software
-    and Nmrbox-Version fields we need.
-    """
-    try:
-        result = subprocess.run(
-            ["apt-cache", "rdepends", "--installed", package],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return None, None
-
-        # Output format:
-        #   package
-        #   Reverse Depends:
-        #     rdep1
-        #     rdep2
-        for line in result.stdout.splitlines():
-            rdep = line.strip()
-            if not rdep or rdep == package or rdep.endswith(":"):
-                continue
-            sw, ver = _get_nmrbox_metadata(rdep)
-            if sw and ver:
-                return sw, ver
+            for line in result.stdout.splitlines():
+                parts = line.split('\t')
+                if len(parts) >= 3 and parts[1].strip() and parts[2].strip():
+                    nmrbox_pkgs[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return None, None
+
+    # Build reverse mapping: dependency -> set of (software, version) from NMRBox packages.
+    # This handles the case where a binary lives in a plain upstream package that was
+    # pulled in as a dependency of an nmrbox-tool-* wrapper.
+    dep_to_nmrbox = {}
+    for pkg, (sw, ver) in nmrbox_pkgs.items():
+        try:
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f", "${Depends}\n${Pre-Depends}\n", pkg],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.splitlines():
+                for dep_spec in line.split(','):
+                    dep_name = dep_spec.strip().split('(')[0].split('|')[0].strip()
+                    if dep_name:
+                        dep_to_nmrbox.setdefault(dep_name, set()).add((sw, ver))
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    return nmrbox_pkgs, dep_to_nmrbox
+
+
+def _find_owning_packages(files):
+    """Find which dpkg packages own the given files. Returns a set of package names."""
+    # Filter to paths that could plausibly be package-managed
+    pkg_files = sorted({f for f in files
+                        if f.startswith(('/usr/', '/opt/', '/lib/', '/lib64/',
+                                         '/bin/', '/sbin/', '/etc/'))})
+    if not pkg_files:
+        return set()
+
+    packages = set()
+    batch_size = 100
+    for i in range(0, len(pkg_files), batch_size):
+        batch = pkg_files[i:i + batch_size]
+        try:
+            result = subprocess.run(
+                ["dpkg", "-S"] + batch,
+                capture_output=True, text=True, timeout=30,
+            )
+            # Parse output even if returncode != 0 (some files may not be in packages)
+            for line in result.stdout.splitlines():
+                if ': ' in line:
+                    pkg_part = line.split(': ')[0]
+                    # Handle "pkg1, pkg2: /path" format and :arch suffixes
+                    for pkg in pkg_part.split(','):
+                        pkg = pkg.strip().split(':')[0]
+                        if pkg:
+                            packages.add(pkg)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return packages
+
+
+def find_nmrbox_requirements(open_files, nmrbox_pkgs, dep_to_nmrbox):
+    """Match open files against installed NMRBox packages.
+
+    Returns a list of (software, version) tuples for NMRBox packages whose files
+    (or whose dependencies' files) were opened by the monitored process.
+    """
+    # Also resolve symlinks so we match regardless of path form
+    resolved = set()
+    for f in open_files:
+        try:
+            resolved.add(os.path.realpath(f))
+        except (OSError, ValueError):
+            pass
+    all_paths = open_files | resolved
+
+    owning_packages = _find_owning_packages(all_paths)
+
+    found = {}
+    for pkg in owning_packages:
+        # Direct match: the package itself has NMRBox metadata
+        if pkg in nmrbox_pkgs:
+            found[nmrbox_pkgs[pkg]] = True
+        # Reverse dependency: this package is a dep of an NMRBox package
+        if pkg in dep_to_nmrbox:
+            for sw_ver in dep_to_nmrbox[pkg]:
+                found[sw_ver] = True
+
+    return sorted(found.keys())
 
 
 CONDOR_MAPPINGS = (('-', ''),
@@ -456,9 +529,9 @@ def get_machine_cpu_count():
 
 
 def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
-                        nmrbox_software, nmrbox_version, still_climbing):
+                        nmrbox_packages, still_climbing):
     """Present findings to user and let them adjust before writing submit file.
-    Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str)."""
+    Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs)."""
     suggested_mem = format_memory_mb(peak_rss_kb)
     peak_mb = peak_rss_kb / 1024
 
@@ -479,9 +552,10 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
         print(f"  Peak CPUs/threads:  {peak_cpus}")
     print(f"  GPU used:           {'Yes' if gpu_used else 'No'}"
           f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}")
-    if nmrbox_software and nmrbox_version:
-        req = format_nmrbox_requirement(nmrbox_software, nmrbox_version)
-        print(f"  NMRBox requirement: {req}")
+    if nmrbox_packages:
+        for sw, ver in nmrbox_packages:
+            req = format_nmrbox_requirement(sw, ver)
+            print(f"  NMRBox requirement: {req}")
     else:
         print(f"  NMRBox requirement: None")
     print("=" * 60)
@@ -570,23 +644,28 @@ def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
         else:
             gpu_mem_mb = suggested_gpu
 
-    # NMRBox requirement
-    nmrbox_req_str = None
-    if nmrbox_software and nmrbox_version:
-        req = format_nmrbox_requirement(nmrbox_software, nmrbox_version)
-        ans = input(f"  Include NMRBox requirement '{req}'? [Y/n]: ").strip().lower()
-        if ans not in ("n", "no"):
-            nmrbox_req_str = req
-            # Validate against the pool
-            matches = validate_requirements(nmrbox_req_str)
+    # NMRBox requirements
+    nmrbox_req_strs = []
+    if nmrbox_packages:
+        for sw, ver in nmrbox_packages:
+            req = format_nmrbox_requirement(sw, ver)
+            ans = input(f"  Include NMRBox requirement '{req}'? [Y/n]: ").strip().lower()
+            if ans not in ("n", "no"):
+                nmrbox_req_strs.append(req)
+        # Validate combined requirements against the pool
+        if nmrbox_req_strs:
+            combined = ' && '.join(nmrbox_req_strs)
+            matches = validate_requirements(combined)
             if matches is not None and matches == 0:
                 print()
                 print(f"  WARNING: No machines in the pool currently match the")
-                print(f"  requirement '{nmrbox_req_str}'. Your job may remain")
+                print(f"  requirements '{combined}'. Your job may remain")
                 print(f"  idle indefinitely. You may want to check the available")
-                print(f"  versions with: condor_status -af {nmrbox_software}")
+                print(f"  versions with:")
+                for sw, _ver in nmrbox_packages:
+                    print(f"    condor_status -af {sw}")
 
-    return memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str
+    return memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs
 
 
 def needs_file_transfer(binary_path, cmd_args):
@@ -656,7 +735,7 @@ def resolve_submit_filename(output_path, binary_path):
 
 
 def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
-                      use_gpu, gpu_mem_mb, nmrbox_req_str):
+                      use_gpu, gpu_mem_mb, nmrbox_req_strs):
     """Write the HTCondor submit file."""
     cmd_name = os.path.basename(binary_path)
 
@@ -668,9 +747,7 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     transfer_files = needs_file_transfer(binary_path, cmd_args)
 
     # Build requirements list
-    requirements = []
-    if nmrbox_req_str:
-        requirements.append(nmrbox_req_str)
+    requirements = list(nmrbox_req_strs)
 
     lines = []
     lines.append(f"universe = vanilla")
@@ -720,20 +797,22 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
 def main():
     timeout, output_path, cmd = parse_args()
 
-    # Start package inspection in background while we monitor
-    pkg_result = {}
+    # Resolve binary path
+    binary_path = shutil.which(cmd[0]) or cmd[0]
 
-    def _inspect():
-        bp, sw, ver = inspect_package(cmd[0])
-        pkg_result["binary_path"] = bp
-        pkg_result["nmrbox_software"] = sw
-        pkg_result["nmrbox_version"] = ver
+    # Pre-compute NMRBox package data in background while we monitor
+    nmrbox_data = {}
 
-    inspect_thread = threading.Thread(target=_inspect, daemon=True)
-    inspect_thread.start()
+    def _precompute():
+        pkgs, dep_map = precompute_nmrbox_data()
+        nmrbox_data["pkgs"] = pkgs
+        nmrbox_data["dep_map"] = dep_map
+
+    precompute_thread = threading.Thread(target=_precompute, daemon=True)
+    precompute_thread.start()
 
     # Monitor the process
-    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code = \
+    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files = \
         monitor_process(cmd, timeout)
 
     # Warn if the process failed quickly
@@ -746,19 +825,18 @@ def main():
             print("Aborted.")
             sys.exit(1)
 
-    # Wait for package inspection to finish (should already be done)
-    inspect_thread.join(timeout=15)
-    binary_path = pkg_result.get("binary_path")
-    nmrbox_software = pkg_result.get("nmrbox_software")
-    nmrbox_version = pkg_result.get("nmrbox_version")
+    # Wait for NMRBox pre-computation to finish (should already be done)
+    precompute_thread.join(timeout=15)
+    nmrbox_pkgs = nmrbox_data.get("pkgs", {})
+    dep_map = nmrbox_data.get("dep_map", {})
 
-    if not binary_path:
-        binary_path = cmd[0]  # Use as-is if we couldn't resolve it
+    # Find NMRBox packages used by the monitored process
+    nmrbox_packages = find_nmrbox_requirements(all_open_files, nmrbox_pkgs, dep_map)
 
     # Interactive confirmation
-    memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_str = interactive_confirm(
+    memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs = interactive_confirm(
         peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
-        nmrbox_software, nmrbox_version, still_climbing
+        nmrbox_packages, still_climbing
     )
 
     # Resolve output filename (check for collisions)
@@ -767,7 +845,7 @@ def main():
     # Write submit file
     cmd_args = cmd[1:] if len(cmd) > 1 else []
     write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
-                      use_gpu, gpu_mem_mb, nmrbox_req_str)
+                      use_gpu, gpu_mem_mb, nmrbox_req_strs)
 
 
 if __name__ == "__main__":
