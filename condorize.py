@@ -214,12 +214,26 @@ def _file_scanner(root_pid, stop_event, all_open_files):
     while not stop_event.is_set():
         try:
             pids = get_process_tree_pids(root_pid)
-            # Fast: read /proc/PID/exe for every PID (catches short-lived children)
             for pid in pids:
+                # Fast: read /proc/PID/exe (catches compiled binaries)
                 try:
                     exe = os.readlink(f"/proc/{pid}/exe")
                     if exe.startswith('/'):
                         all_open_files.add(exe)
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass
+                # Fast: read /proc/PID/cmdline (catches script files —
+                # when bash runs a script, exe points to the interpreter
+                # but cmdline contains the script path)
+                try:
+                    with open(f"/proc/{pid}/cmdline", 'rb') as f:
+                        for arg in f.read().split(b'\0'):
+                            try:
+                                arg = arg.decode('utf-8', errors='replace')
+                            except Exception:
+                                continue
+                            if arg.startswith('/'):
+                                all_open_files.add(arg)
                 except (FileNotFoundError, PermissionError, OSError):
                     pass
             # Slower: full maps + fd scan every ~1 s (20 iterations * 50 ms)
