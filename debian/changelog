@@ -1,5 +1,11 @@
 nmrbox-tool-condorize (1.0.1-1) UNRELEASED; urgency=medium
 
-  * Initial release. 
+  * Improve detection logic to support when multiple NMRbox tools are used in a single job. Also improve CPU usage detection logic.
+
+ -- Jon Wedell <wedell@uchc.edu>  Tue, 07 Apr 2026 00:00:00 -0400
+
+nmrbox-tool-condorize (1.0-1) UNRELEASED; urgency=medium
+
+  * Initial release.
 
  -- Gerard Weatherby <gweatherby@uchc.edu>  Mon, 16 Mar 2026 14:42:56 -0400
