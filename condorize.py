@@ -421,11 +421,9 @@ def monitor_process(cmd, timeout):
 
 
 def precompute_nmrbox_data():
-    """Build a mapping of all installed NMRBox packages and a reverse dependency map.
+    """Build a mapping of all installed NMRBox packages.
 
-    Returns (nmrbox_pkgs, dep_to_nmrbox) where:
-      nmrbox_pkgs: {package_name: (software, version)}
-      dep_to_nmrbox: {dependency_name: {(software, version), ...}}
+    Returns nmrbox_pkgs: {package_name: (software, version)}
 
     Safe to call from a background thread.
     """
@@ -446,27 +444,7 @@ def precompute_nmrbox_data():
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # Build reverse mapping: dependency -> set of (software, version) from NMRBox packages.
-    # This handles the case where a binary lives in a plain upstream package that was
-    # pulled in as a dependency of an nmrbox-tool-* wrapper.
-    dep_to_nmrbox = {}
-    for pkg, (sw, ver) in nmrbox_pkgs.items():
-        try:
-            result = subprocess.run(
-                ["dpkg-query", "-W", "-f", "${Depends}\n${Pre-Depends}\n", pkg],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                continue
-            for line in result.stdout.splitlines():
-                for dep_spec in line.split(','):
-                    dep_name = dep_spec.strip().split('(')[0].split('|')[0].strip()
-                    if dep_name:
-                        dep_to_nmrbox.setdefault(dep_name, set()).add((sw, ver))
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-
-    return nmrbox_pkgs, dep_to_nmrbox
+    return nmrbox_pkgs
 
 
 def _find_owning_packages(files):
@@ -501,11 +479,11 @@ def _find_owning_packages(files):
     return packages
 
 
-def find_nmrbox_requirements(open_files, nmrbox_pkgs, dep_to_nmrbox):
+def find_nmrbox_requirements(open_files, nmrbox_pkgs):
     """Match open files against installed NMRBox packages.
 
     Returns a list of (software, version) tuples for NMRBox packages whose files
-    (or whose dependencies' files) were opened by the monitored process.
+    were opened by the monitored process.
     """
     # Also resolve symlinks so we match regardless of path form
     resolved = set()
@@ -520,13 +498,8 @@ def find_nmrbox_requirements(open_files, nmrbox_pkgs, dep_to_nmrbox):
 
     found = {}
     for pkg in owning_packages:
-        # Direct match: the package itself has NMRBox metadata
         if pkg in nmrbox_pkgs:
             found[nmrbox_pkgs[pkg]] = True
-        # Reverse dependency: this package is a dep of an NMRBox package
-        if pkg in dep_to_nmrbox:
-            for sw_ver in dep_to_nmrbox[pkg]:
-                found[sw_ver] = True
 
     return sorted(found.keys())
 
@@ -862,9 +835,7 @@ def main():
     nmrbox_data = {}
 
     def _precompute():
-        pkgs, dep_map = precompute_nmrbox_data()
-        nmrbox_data["pkgs"] = pkgs
-        nmrbox_data["dep_map"] = dep_map
+        nmrbox_data["pkgs"] = precompute_nmrbox_data()
 
     precompute_thread = threading.Thread(target=_precompute, daemon=True)
     precompute_thread.start()
@@ -886,10 +857,9 @@ def main():
     # Wait for NMRBox pre-computation to finish (should already be done)
     precompute_thread.join(timeout=15)
     nmrbox_pkgs = nmrbox_data.get("pkgs", {})
-    dep_map = nmrbox_data.get("dep_map", {})
 
     # Find NMRBox packages used by the monitored process
-    nmrbox_packages = find_nmrbox_requirements(all_open_files, nmrbox_pkgs, dep_map)
+    nmrbox_packages = find_nmrbox_requirements(all_open_files, nmrbox_pkgs)
 
     # Interactive confirmation
     memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs = interactive_confirm(
