@@ -14,3 +14,4 @@ Multi-Arch: foreign
 Depends: ${misc:Depends}, python3
 Description: A command-line tool that monitors a program's resource usage and generates an HTCondor submit file. 
  A command-line tool that monitors a program's resource usage and generates an HTCondor submit file. Designed for NMRbox users who want to run jobs on the HTCondor pool without writing submit files by hand.
+XB-Nmrbox-Url: https://github.com/NMRbox/condorize.git
