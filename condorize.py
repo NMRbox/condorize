@@ -124,6 +124,26 @@ def read_proc_threads(pid):
     return 0
 
 
+def read_proc_cpu_ticks(pid):
+    """Read total CPU ticks (utime + stime) from /proc/PID/stat.
+    Returns ticks consumed, or 0 on failure."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # The comm field (field 2) is in parens and may contain spaces/parens.
+        # Find the last ')' to reliably skip past it.
+        i = data.rfind(')')
+        if i < 0:
+            return 0
+        fields = data[i + 2:].split()
+        # After ')': state(0), ppid(1), ..., utime(11), stime(12)
+        utime = int(fields[11])
+        stime = int(fields[12])
+        return utime + stime
+    except (FileNotFoundError, PermissionError, IndexError, ValueError):
+        return 0
+
+
 def check_gpu_fd(pid):
     """Check if process has /dev/nvidia* file descriptors open."""
     try:
@@ -247,7 +267,7 @@ def _file_scanner(root_pid, stop_event, all_open_files):
 
 def monitor_process(cmd, timeout):
     """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
-    Returns (peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files)."""
+    Returns (peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files)."""
     try:
         proc = subprocess.Popen(cmd)
     except FileNotFoundError:
@@ -262,7 +282,6 @@ def monitor_process(cmd, timeout):
     pid = proc.pid
 
     peak_rss_kb = 0
-    peak_cpus = 1
     gpu_used = False
     gpu_memory_mb = 0
     exited_early = False
@@ -270,6 +289,11 @@ def monitor_process(cmd, timeout):
     all_open_files = set()
     # Track recent memory samples to detect if usage is still climbing
     recent_rss = []
+    # Track CPU ticks to compute average CPU utilization
+    clock_ticks_per_sec = os.sysconf('SC_CLK_TCK')
+    total_cpu_ticks = 0
+    prev_ticks = {}  # pid -> last known ticks
+    first_sample = True
     start = time.time()
 
     # Start background file scanner to catch short-lived child processes
@@ -302,9 +326,24 @@ def monitor_process(cmd, timeout):
             if len(recent_rss) > 10:
                 recent_rss.pop(0)
 
-            # CPUs: count total threads across process tree
-            total_threads = sum(read_proc_threads(p) for p in pids)
-            peak_cpus = max(peak_cpus, total_threads)
+            # CPUs: track cumulative CPU ticks across the process tree.
+            # On each sample we compute the delta in ticks per process;
+            # for new processes we count their full accumulated ticks
+            # (they just spawned, so this approximates time since last sample).
+            current_ticks = {}
+            for p in pids:
+                current_ticks[p] = read_proc_cpu_ticks(p)
+            if first_sample:
+                # Record baseline; don't count any ticks yet
+                first_sample = False
+            else:
+                for p, ticks in current_ticks.items():
+                    if p in prev_ticks:
+                        total_cpu_ticks += max(0, ticks - prev_ticks[p])
+                    else:
+                        # New process - count all its accumulated ticks
+                        total_cpu_ticks += ticks
+            prev_ticks = current_ticks
 
             # GPU: check file descriptors
             if not gpu_used:
@@ -321,9 +360,13 @@ def monitor_process(cmd, timeout):
 
             elapsed = time.time() - start
             rss_mb = peak_rss_kb / 1024
+            if elapsed > 0:
+                avg_cpus = total_cpu_ticks / (clock_ticks_per_sec * elapsed)
+            else:
+                avg_cpus = 0
             sys.stdout.write(
                 f"\r  [{elapsed:.0f}s/{timeout}s] Peak RSS: {rss_mb:.1f} MB | "
-                f"CPUs: {peak_cpus} | "
+                f"Avg CPUs: {avg_cpus:.1f} | "
                 f"GPU: {'Yes' if gpu_used else 'No'}"
                 f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}   "
             )
@@ -366,7 +409,15 @@ def monitor_process(cmd, timeout):
         if avg_first > 0 and (avg_second - avg_first) / avg_first > 0.10:
             still_climbing = True
 
-    return peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files
+    # Compute average CPUs used over the monitoring period
+    elapsed = time.time() - start
+    if elapsed > 0 and total_cpu_ticks > 0:
+        avg_cpus = total_cpu_ticks / (clock_ticks_per_sec * elapsed)
+    else:
+        avg_cpus = 1
+    suggested_cpus = max(1, int(math.ceil(avg_cpus)))
+
+    return peak_rss_kb, suggested_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files
 
 
 def precompute_nmrbox_data():
@@ -537,33 +588,26 @@ def validate_requirements(nmrbox_req_str):
         return None
 
 
-def get_machine_cpu_count():
-    """Return the number of CPUs on this machine."""
-    return os.cpu_count() or 1
-
-
-def interactive_confirm(peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
+def interactive_confirm(peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
                         nmrbox_packages, still_climbing):
     """Present findings to user and let them adjust before writing submit file.
     Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs)."""
     suggested_mem = format_memory_mb(peak_rss_kb)
     peak_mb = peak_rss_kb / 1024
 
-    # Cap suggested CPUs at the number of CPUs on this machine, since a
-    # program cannot usefully use more CPUs than the machine has, even if
-    # it spawns more threads (e.g. MATLAB's JVM and thread-pool workers).
-    machine_cpus = get_machine_cpu_count()
-    suggested_cpus = min(peak_cpus, machine_cpus)
+    # Cap suggested CPUs at 32; jobs requesting more take much longer to match.
+    max_cpus = 32
+    suggested_cpus = min(avg_cpus, max_cpus)
 
     print("\n" + "=" * 60)
     print("  Condorize - Detected Settings")
     print("=" * 60)
     print(f"  Peak memory (RSS):  {peak_mb:.1f} MB")
     print(f"  Suggested request:  {suggested_mem} MB (with 25% headroom)")
-    if peak_cpus > machine_cpus:
-        print(f"  Peak threads:       {peak_cpus} (capped to {machine_cpus} machine CPUs)")
+    if avg_cpus > max_cpus:
+        print(f"  Avg CPUs used:      {avg_cpus} (capped to {max_cpus})")
     else:
-        print(f"  Peak CPUs/threads:  {peak_cpus}")
+        print(f"  Avg CPUs used:      {avg_cpus}")
     print(f"  GPU used:           {'Yes' if gpu_used else 'No'}"
           f"{f' ({gpu_memory_mb} MB)' if gpu_memory_mb else ''}")
     if nmrbox_packages:
@@ -826,7 +870,7 @@ def main():
     precompute_thread.start()
 
     # Monitor the process
-    peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files = \
+    peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files = \
         monitor_process(cmd, timeout)
 
     # Warn if the process failed quickly
@@ -849,7 +893,7 @@ def main():
 
     # Interactive confirmation
     memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs = interactive_confirm(
-        peak_rss_kb, peak_cpus, gpu_used, gpu_memory_mb,
+        peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
         nmrbox_packages, still_climbing
     )
 
