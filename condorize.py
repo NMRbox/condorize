@@ -785,7 +785,6 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     lines.append(f"executable = {binary_path}")
     if arguments:
         lines.append(f"arguments = {arguments}")
-    lines.append(f"initialdir = {os.getcwd()}")
     lines.append(f"")
     lines.append(f"request_memory = {memory_mb}")
     lines.append(f"request_cpus = {cpus}")
