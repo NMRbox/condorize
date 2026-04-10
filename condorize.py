@@ -808,15 +808,20 @@ def resolve_submit_filename(output_path, binary_path):
     return submit_filename
 
 
-def build_memory_schedule(initial_mb, max_memory_mb=81920):
-    """Compute escalating memory levels, each 1.5x the previous, up to at least max_memory_mb.
+def build_memory_schedule(initial_mb, double_until_mb=40960, max_memory_mb=122880):
+    """Compute escalating memory levels up to max_memory_mb (120 GB).
+
+    Doubles the request each retry until reaching at least double_until_mb (40 GB),
+    then increases by 50% each retry until reaching at least max_memory_mb (120 GB).
 
     Returns a list of memory values in MB starting from initial_mb.
-    The last value will be >= max_memory_mb (unless initial_mb already exceeds it).
     """
     levels = [initial_mb]
     while levels[-1] < max_memory_mb:
-        levels.append(int(math.ceil(levels[-1] * 1.5)))
+        if levels[-1] < double_until_mb:
+            levels.append(int(math.ceil(levels[-1] * 2)))
+        else:
+            levels.append(int(math.ceil(levels[-1] * 1.5)))
     return levels
 
 
@@ -850,7 +855,7 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     # Build requirements list
     requirements = list(nmrbox_req_strs)
 
-    # Build escalating memory schedule: increase by 50% each retry until >= 80 GB
+    # Build escalating memory schedule: double until 40 GB, then +50% until 120 GB
     memory_levels = build_memory_schedule(memory_mb)
     max_retries = len(memory_levels) - 1
     memory_expr = build_memory_expression(memory_levels)
@@ -862,8 +867,8 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
         lines.append(f"arguments = {arguments}")
     lines.append(f"")
     if max_retries > 0:
-        lines.append(f"# Memory auto-scaling: starts at {memory_mb} MB, increases by 50% each")
-        lines.append(f"# retry up to {memory_levels[-1]} MB ({max_retries} retries)")
+        lines.append(f"# Memory auto-scaling: starts at {memory_mb} MB, doubles until 40 GB,")
+        lines.append(f"# then increases by 50% up to {memory_levels[-1]} MB ({max_retries} retries)")
         lines.append(f"request_memory = {memory_expr}")
     else:
         lines.append(f"request_memory = {memory_mb}")
