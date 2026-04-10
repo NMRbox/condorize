@@ -1,3 +1,12 @@
+nmrbox-tool-condorize (1.1-1) UNRELEASED; urgency=medium
+
+  * Terminate the entire process group rather than just the monitored process.
+  * Flush pipes and wait for terminated processes before printing analysis.
+  * Add custom MATLAB version detection.
+  * Use nmrboxdata package and direct reads to query package data rather than dpkg and dpkg-query.
+
+ -- Jon Wedell <wedell@uchc.edu>  Fri, 10 Apr 2026 00:00:00 -0400
+
 nmrbox-tool-condorize (1.0.1-1) UNRELEASED; urgency=medium
 
   * Improve detection logic to support when multiple NMRbox tools are used in a single job. Also improve CPU usage detection logic.
