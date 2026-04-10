@@ -556,7 +556,7 @@ def format_memory_mb(kb):
     mb = kb / 1024
     mb_with_headroom = mb * 1.25
     # Round up to nearest 64 MB for cleaner values
-    return max(64, int(math.ceil(mb_with_headroom / 64) * 64))
+    return max(2048, int(math.ceil(mb_with_headroom / 64) * 64))
 
 
 def validate_requirements(nmrbox_req_str):
@@ -808,6 +808,33 @@ def resolve_submit_filename(output_path, binary_path):
     return submit_filename
 
 
+def build_memory_schedule(initial_mb, max_memory_mb=81920):
+    """Compute escalating memory levels, each 1.5x the previous, up to at least max_memory_mb.
+
+    Returns a list of memory values in MB starting from initial_mb.
+    The last value will be >= max_memory_mb (unless initial_mb already exceeds it).
+    """
+    levels = [initial_mb]
+    while levels[-1] < max_memory_mb:
+        levels.append(int(math.ceil(levels[-1] * 1.5)))
+    return levels
+
+
+def build_memory_expression(memory_levels):
+    """Build a ClassAd ifThenElse expression for request_memory that scales with NumJobStarts.
+
+    Given levels [1024, 1536, 2304, 3456], produces:
+      ifThenElse(NumJobStarts == 0, 1024, ifThenElse(NumJobStarts == 1, 1536, ...))
+    """
+    if len(memory_levels) == 1:
+        return str(memory_levels[0])
+    # Build from the inside out; the final fallback is the last (largest) level
+    expr = str(memory_levels[-1])
+    for i in range(len(memory_levels) - 2, -1, -1):
+        expr = f"ifThenElse(NumJobStarts == {i}, {memory_levels[i]}, {expr})"
+    return expr
+
+
 def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
                       use_gpu, gpu_mem_mb, nmrbox_req_strs):
     """Write the HTCondor submit file."""
@@ -823,13 +850,23 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     # Build requirements list
     requirements = list(nmrbox_req_strs)
 
+    # Build escalating memory schedule: increase by 50% each retry until >= 80 GB
+    memory_levels = build_memory_schedule(memory_mb)
+    max_retries = len(memory_levels) - 1
+    memory_expr = build_memory_expression(memory_levels)
+
     lines = []
     lines.append(f"universe = vanilla")
     lines.append(f"executable = {binary_path}")
     if arguments:
         lines.append(f"arguments = {arguments}")
     lines.append(f"")
-    lines.append(f"request_memory = {memory_mb}")
+    if max_retries > 0:
+        lines.append(f"# Memory auto-scaling: starts at {memory_mb} MB, increases by 50% each")
+        lines.append(f"# retry up to {memory_levels[-1]} MB ({max_retries} retries)")
+        lines.append(f"request_memory = {memory_expr}")
+    else:
+        lines.append(f"request_memory = {memory_mb}")
     lines.append(f"request_cpus = {cpus}")
     lines.append(f"request_disk = 2GB")
     if use_gpu:
@@ -846,6 +883,10 @@ def write_submit_file(submit_filename, binary_path, cmd_args, memory_mb, cpus,
     lines.append(f"error = {cmd_name}.$(Cluster).$(Process).err")
     lines.append(f"log = {cmd_name}.$(Cluster).$(Process).log")
     lines.append(f"")
+    if max_retries > 0:
+        lines.append(f"# Auto-release jobs held for exceeding memory, up to {max_retries} retries")
+        lines.append(f"periodic_release = (HoldReasonCode == 34) && (NumJobStarts < {len(memory_levels)})")
+        lines.append(f"")
     if transfer_files:
         lines.append(f"should_transfer_files = IF_NEEDED")
     else:
