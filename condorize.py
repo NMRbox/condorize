@@ -5,6 +5,7 @@ import argparse
 import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -273,7 +274,7 @@ def monitor_process(cmd, timeout):
     """Run cmd for up to timeout seconds, monitoring memory, CPU, and GPU usage.
     Returns (peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb, still_climbing, exited_early, exit_code, all_open_files)."""
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, start_new_session=True)
     except FileNotFoundError:
         print(f"Error: Command not found: {cmd[0]}", file=sys.stderr)
         sys.exit(1)
@@ -378,22 +379,24 @@ def monitor_process(cmd, timeout):
 
             time.sleep(0.5)
         else:
-            # Timeout reached - terminate
+            # Timeout reached - terminate entire process group
             print(f"\n\nTimeout reached ({timeout}s). Terminating process...")
-            proc.terminate()
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 print("Process did not exit after SIGTERM, sending SIGKILL...")
-                proc.kill()
+                os.killpg(pgid, signal.SIGKILL)
                 proc.wait(timeout=5)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Terminating process...")
-        proc.terminate()
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            os.killpg(pgid, signal.SIGKILL)
             proc.wait()
 
     # Stop the file scanner
