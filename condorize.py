@@ -478,13 +478,13 @@ def find_matlab_versions(open_files):
     for f in open_files:
         m = matlab_re.match(f)
         if m:
-            versions.add(m.group(1))
+            versions.add(m.group(1).lower())
         # Also check resolved symlinks
         try:
             resolved = os.path.realpath(f)
             m = matlab_re.match(resolved)
             if m:
-                versions.add(m.group(1))
+                versions.add(m.group(1).lower())
         except (OSError, ValueError):
             pass
     return sorted(versions)
