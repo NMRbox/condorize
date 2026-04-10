@@ -1,1 +1,1 @@
-nmrboxdata
+nmrboxdata>=5,<6
