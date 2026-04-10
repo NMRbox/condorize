@@ -4,6 +4,7 @@
 import argparse
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -463,11 +464,35 @@ def precompute_nmrbox_data():
     return file_to_sw
 
 
+def find_matlab_versions(open_files):
+    """Detect MATLAB versions from open file paths.
+
+    Scans for paths matching /usr/software/MATLAB/<version>/... and returns
+    a sorted list of version strings found (e.g. ['r2025b']).
+    """
+    matlab_re = re.compile(r'^/usr/software/MATLAB/([^/]+)/')
+    versions = set()
+    for f in open_files:
+        m = matlab_re.match(f)
+        if m:
+            versions.add(m.group(1))
+        # Also check resolved symlinks
+        try:
+            resolved = os.path.realpath(f)
+            m = matlab_re.match(resolved)
+            if m:
+                versions.add(m.group(1))
+        except (OSError, ValueError):
+            pass
+    return sorted(versions)
+
+
 def find_nmrbox_requirements(open_files, file_to_sw):
     """Match open files against installed NMRBox packages.
 
     Returns a list of (software, version) tuples for NMRBox packages whose files
-    were opened by the monitored process.
+    were opened by the monitored process. Excludes MATLAB packages, which are
+    detected separately via find_matlab_versions.
     """
     # Also resolve symlinks so we match regardless of path form
     resolved = set()
@@ -482,6 +507,9 @@ def find_nmrbox_requirements(open_files, file_to_sw):
     for path in all_paths:
         sw_ver = file_to_sw.get(path)
         if sw_ver is not None:
+            # Skip MATLAB - handled separately
+            if sw_ver[0].lower() == 'matlab':
+                continue
             found[sw_ver] = True
 
     return sorted(found.keys())
@@ -507,6 +535,11 @@ def format_nmrbox_requirement(software, version):
     """Format NMRBox software/version into a condor requirement string."""
     formatted_version = valid_condor_identifier(version)
     return f'{software} == "{formatted_version}"'
+
+
+def format_matlab_requirement(version):
+    """Format a MATLAB version into a condor requirement string."""
+    return f'stringListMember("{version}", MATLAB)'
 
 
 def format_memory_mb(kb):
@@ -545,7 +578,7 @@ def validate_requirements(nmrbox_req_str):
 
 
 def interactive_confirm(peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
-                        nmrbox_packages, still_climbing):
+                        nmrbox_packages, matlab_versions, still_climbing):
     """Present findings to user and let them adjust before writing submit file.
     Returns (memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs)."""
     suggested_mem = format_memory_mb(peak_rss_kb)
@@ -572,6 +605,10 @@ def interactive_confirm(peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
             print(f"  NMRBox requirement: {req}")
     else:
         print(f"  NMRBox requirement: None")
+    if matlab_versions:
+        for ver in matlab_versions:
+            req = format_matlab_requirement(ver)
+            print(f"  MATLAB requirement: {req}")
     print("=" * 60)
 
     if still_climbing:
@@ -666,20 +703,34 @@ def interactive_confirm(peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
             ans = input(f"  Include NMRBox requirement '{req}'? [Y/n]: ").strip().lower()
             if ans not in ("n", "no"):
                 nmrbox_req_strs.append(req)
-        # Validate combined requirements against the pool
-        if nmrbox_req_strs:
-            combined = ' && '.join(nmrbox_req_strs)
-            matches = validate_requirements(combined)
-            if matches is not None and matches == 0:
-                print()
-                print(f"  WARNING: No machines in the pool currently match the")
-                print(f"  requirements '{combined}'. Your job may remain")
-                print(f"  idle indefinitely. You may want to check the available")
-                print(f"  versions with:")
-                for sw, _ver in nmrbox_packages:
-                    print(f"    condor_status -af {sw}")
 
-    return memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs
+    # MATLAB requirements
+    matlab_req_strs = []
+    if matlab_versions:
+        for ver in matlab_versions:
+            req = format_matlab_requirement(ver)
+            ans = input(f"  Include MATLAB requirement '{req}'? [Y/n]: ").strip().lower()
+            if ans not in ("n", "no"):
+                matlab_req_strs.append(req)
+
+    all_req_strs = nmrbox_req_strs + matlab_req_strs
+
+    # Validate combined requirements against the pool
+    if all_req_strs:
+        combined = ' && '.join(all_req_strs)
+        matches = validate_requirements(combined)
+        if matches is not None and matches == 0:
+            print()
+            print(f"  WARNING: No machines in the pool currently match the")
+            print(f"  requirements '{combined}'. Your job may remain")
+            print(f"  idle indefinitely. You may want to check the available")
+            print(f"  versions with:")
+            for sw, _ver in nmrbox_packages:
+                print(f"    condor_status -af {sw}")
+            if matlab_req_strs:
+                print(f"    condor_status -af MATLAB")
+
+    return memory_mb, cpus, use_gpu, gpu_mem_mb, all_req_strs
 
 
 def needs_file_transfer(binary_path, cmd_args):
@@ -843,10 +894,13 @@ def main():
     # Find NMRBox packages used by the monitored process
     nmrbox_packages = find_nmrbox_requirements(all_open_files, file_to_sw)
 
+    # Detect MATLAB versions from open file paths
+    matlab_versions = find_matlab_versions(all_open_files)
+
     # Interactive confirmation
     memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs = interactive_confirm(
         peak_rss_kb, avg_cpus, gpu_used, gpu_memory_mb,
-        nmrbox_packages, still_climbing
+        nmrbox_packages, matlab_versions, still_climbing
     )
 
     # Resolve output filename (check for collisions)
