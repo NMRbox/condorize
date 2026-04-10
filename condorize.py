@@ -1,14 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/software/condorize/bin/python3
 """condorize - Monitor a program's resource usage and generate an HTCondor submit file."""
 
 import argparse
 import math
 import os
-import subprocess
 import shutil
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+
+from nmrboxdata.statusparser import StatusParser
 
 __version__ = "1.0.1"
 
@@ -421,65 +424,46 @@ def monitor_process(cmd, timeout):
 
 
 def precompute_nmrbox_data():
-    """Build a mapping of all installed NMRBox packages.
+    """Build a mapping of file paths to NMRBox (software, version) tuples.
 
-    Returns nmrbox_pkgs: {package_name: (software, version)}
+    Reads package metadata from /var/lib/dpkg/status via statusparser, then
+    reads .list files to find which files each NMRBox package installed.
+
+    Returns file_to_sw: {file_path: (software, version)}
 
     Safe to call from a background thread.
     """
-    nmrbox_pkgs = {}
+    file_to_sw = {}
 
-    # Get all installed packages with NMRBox metadata in one call
     try:
-        result = subprocess.run(
-            ["dpkg-query", "-W", "-f",
-             "${Package}\t${Nmrbox-Software}\t${Nmrbox-Version}\n"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                parts = line.split('\t')
-                if len(parts) >= 3 and parts[1].strip() and parts[2].strip():
-                    nmrbox_pkgs[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        sp = StatusParser()
+        sp.parse('/var/lib/dpkg/status')
+        info_dir = Path('/var/lib/dpkg/info')
+        for entry in sp.entries:
+            if not entry.Nmrbox_Software or not entry.Nmrbox_Version:
+                continue
+            sw_ver = (entry.Nmrbox_Software, entry.Nmrbox_Version)
+            # Try both plain and arch-qualified .list filenames
+            for list_name in (f"{entry.Package}.list",
+                              f"{entry.identity}.list"):
+                list_path = info_dir / list_name
+                try:
+                    for line in list_path.read_text().splitlines():
+                        line = line.strip()
+                        if line:
+                            file_to_sw[line] = sw_ver
+                    break
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    break
+    except Exception:
         pass
 
-    return nmrbox_pkgs
+    return file_to_sw
 
 
-def _find_owning_packages(files):
-    """Find which dpkg packages own the given files. Returns a set of package names."""
-    # Filter to paths that could plausibly be package-managed
-    pkg_files = sorted({f for f in files
-                        if f.startswith(('/usr/', '/opt/', '/lib/', '/lib64/',
-                                         '/bin/', '/sbin/', '/etc/'))})
-    if not pkg_files:
-        return set()
-
-    packages = set()
-    batch_size = 100
-    for i in range(0, len(pkg_files), batch_size):
-        batch = pkg_files[i:i + batch_size]
-        try:
-            result = subprocess.run(
-                ["dpkg", "-S"] + batch,
-                capture_output=True, text=True, timeout=30,
-            )
-            # Parse output even if returncode != 0 (some files may not be in packages)
-            for line in result.stdout.splitlines():
-                if ': ' in line:
-                    pkg_part = line.split(': ')[0]
-                    # Handle "pkg1, pkg2: /path" format and :arch suffixes
-                    for pkg in pkg_part.split(','):
-                        pkg = pkg.strip().split(':')[0]
-                        if pkg:
-                            packages.add(pkg)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    return packages
-
-
-def find_nmrbox_requirements(open_files, nmrbox_pkgs):
+def find_nmrbox_requirements(open_files, file_to_sw):
     """Match open files against installed NMRBox packages.
 
     Returns a list of (software, version) tuples for NMRBox packages whose files
@@ -494,12 +478,11 @@ def find_nmrbox_requirements(open_files, nmrbox_pkgs):
             pass
     all_paths = open_files | resolved
 
-    owning_packages = _find_owning_packages(all_paths)
-
     found = {}
-    for pkg in owning_packages:
-        if pkg in nmrbox_pkgs:
-            found[nmrbox_pkgs[pkg]] = True
+    for path in all_paths:
+        sw_ver = file_to_sw.get(path)
+        if sw_ver is not None:
+            found[sw_ver] = True
 
     return sorted(found.keys())
 
@@ -855,10 +838,10 @@ def main():
 
     # Wait for NMRBox pre-computation to finish (should already be done)
     precompute_thread.join(timeout=15)
-    nmrbox_pkgs = nmrbox_data.get("pkgs", {})
+    file_to_sw = nmrbox_data.get("pkgs", {})
 
     # Find NMRBox packages used by the monitored process
-    nmrbox_packages = find_nmrbox_requirements(all_open_files, nmrbox_pkgs)
+    nmrbox_packages = find_nmrbox_requirements(all_open_files, file_to_sw)
 
     # Interactive confirmation
     memory_mb, cpus, use_gpu, gpu_mem_mb, nmrbox_req_strs = interactive_confirm(

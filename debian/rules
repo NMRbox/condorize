@@ -18,12 +18,12 @@
 # NMRbox additions
 export DEB_BUILD_OPTIONS=noddebs
 
+VENV_DIR = /usr/software/condorize
+
 %:
 	dh $@
 
-
-# dh_make generated override targets.
-# This is an example for Cmake (see <https://bugs.debian.org/641051>).
-#override_dh_auto_configure:
-#	dh_auto_configure -- \
-#	-DCMAKE_LIBRARY_PATH=$(DEB_HOST_MULTIARCH)
+override_dh_auto_install:
+	python3 -m venv debian/nmrbox-tool-condorize$(VENV_DIR)
+	debian/nmrbox-tool-condorize$(VENV_DIR)/bin/pip install --no-cache-dir -r requirements.txt
+	install -m 755 condorize.py debian/nmrbox-tool-condorize$(VENV_DIR)/bin/condorize.py

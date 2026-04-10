@@ -1,1 +1,1 @@
-/usr/software/bin/condorize.py /usr/software/bin/condorize
+/usr/software/condorize/bin/condorize.py /usr/software/bin/condorize
