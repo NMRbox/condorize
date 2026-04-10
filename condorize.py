@@ -403,6 +403,12 @@ def monitor_process(cmd, timeout):
     scanner_stop.set()
     scanner_thread.join(timeout=2)
 
+    # Allow child processes to finish writing to stderr/stdout before we
+    # print our own summary, otherwise their dying output interleaves.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.5)
+
     print()
 
     # Detect if resource usage was still climbing when we stopped
