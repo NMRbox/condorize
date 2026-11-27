@@ -147,3 +147,11 @@ shared filesystem.
 - `dpkg` and `dpkg-query` (for package inspection; gracefully skipped if unavailable)
 - `nvidia-smi` (for GPU detection; gracefully skipped if unavailable)
 - `condor_status` (for pool validation; gracefully skipped if unavailable)
+
+## Example: GROMACS with GPU Support
+
+To generate a submit file for a GPU-accelerated GROMACS run, use `condorize` to monitor the `gmx mdrun` command. For example:
+
+```bash
+condorize --output gromacs_gpu.sub -- gmx mdrun -s md.tpr -deffnm md -ntmpi 1 -ntomp 4 -nb gpu -pme gpu -bonded gpu -update gpu
+After monitoring, condorize will detect the GPU usage and suggest a request_gpus = 1 in the generated submit file. You can then edit the file to add specific GPU requirements if needed (e.g., requirements = (GPUs_Capability >= 8)).
